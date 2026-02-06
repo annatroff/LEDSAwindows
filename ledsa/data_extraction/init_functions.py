@@ -125,7 +125,7 @@ def _get_datetime_from_str(date: str, time: str) -> datetime:
     """
     Convert date and time strings to a datetime object.
 
-    :param date: Date string in the format '%Y:%m:%d' or '%d.%m.%Y' or '%Y-%m-%d'.
+    :param date: Date string in the format '%Y:%m:%d' or '%d.%m.%Y'.
     :type date: str
     :param time: Time string in the format '%H:%M:%S'.
     :type time: str
@@ -134,8 +134,6 @@ def _get_datetime_from_str(date: str, time: str) -> datetime:
     """
     if date.find(":") != -1:
         date_time = datetime.strptime(date + ' ' + time, '%Y:%m:%d %H:%M:%S')
-    elif date.find("-") != -1:
-        date_time = datetime.strptime(date + ' ' + time, '%Y-%m-%d %H:%M:%S')
     else:
         date_time = datetime.strptime(date + ' ' + time, '%d.%m.%Y %H:%M:%S')
     return date_time
@@ -195,10 +193,7 @@ def _build_img_data_string(build_type: str, config: ConfigData) -> str:
     img_increment = config.getint(build_type, 'num_skip_imgs') + 1 if build_type == 'analyse_photo' else 1
     img_id_list = _find_img_number_list(first_img_id, last_img_id, img_increment)
     for img_id in img_id_list:
-        if '.CR3' in config['DEFAULT']['img_name_string']:
-            tag = 'Creation date'
-        else:
-            tag = 'EXIF DateTimeOriginal'
+        tag = 'DateTimeOriginal'
         experiment_time, time = _calc_experiment_and_real_time(build_type, config, tag, img_id)
         img_data += (str(img_idx) + ',' + config[build_type]['img_name_string'].format(img_id) +
                      ',' + time.strftime('%H:%M:%S') + ',' + str(experiment_time) + '\n')

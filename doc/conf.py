@@ -40,7 +40,6 @@ autodoc_mock_imports = [
     "exifread",
     "rawpy",
     "opencv-python",
-    "hachoir"
 ]
 
 
