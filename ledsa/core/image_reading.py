@@ -94,9 +94,8 @@ def get_exif_entry(filename: str, tag: str) -> str:
     with exiftool.ExifTool(executable=r"C:\Users\a.troff\Desktop\Zusatzprogramme\exiftool-13.49_64\exiftool.exe") as et:
         metadata = et.execute_json(filename)
         meta = metadata[0]
-    full_tag = f'EXIF:{tag}'
     try:
-        return meta[full_tag]
+        return meta[tag]
     except KeyError:
         print("No EXIF metadata found")
         exit(1)

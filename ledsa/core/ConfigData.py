@@ -274,7 +274,7 @@ class ConfigData(cp.ConfigParser):
         time = self['DEFAULT']['time_ref_img_time']
         print(os.path.join(self['DEFAULT']['img_directory'], self['DEFAULT']['img_name_string'].format(
             self['DEFAULT']['time_img_id'])))
-        tag = 'DateTimeOriginal'
+        tag = 'EXIF:DateTimeOriginal'
         exif_entry = get_exif_entry(os.path.join(self['DEFAULT']['img_directory'], self['DEFAULT']['img_name_string']
                                                  .format(str(self['DEFAULT']['time_img_id']))), tag)
         date, time_meta = exif_entry.split(' ')
@@ -354,7 +354,7 @@ class ConfigData(cp.ConfigParser):
 
         """
         exif_entry = get_exif_entry(os.path.join(self['DEFAULT']['img_directory'], self['DEFAULT']['img_name_string'].format(
-            self['DEFAULT']['first_img_experiment_id'])), 'DateTimeOriginal')
+            self['DEFAULT']['first_img_experiment_id'])), 'EXIF:DateTimeOriginal')
         date, time_meta = exif_entry.split(' ')
         time_img = _get_datetime_from_str(date, time_meta)
         start_time = time_img - timedelta(seconds=self['DEFAULT'].getint('exif_time_infront_real_time'))
