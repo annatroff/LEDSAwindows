@@ -6,7 +6,9 @@ import pandas as pd
 
 from ledsa.analysis.Experiment import Experiment, Layers, Camera
 from ledsa.core.file_handling import read_hdf, read_hdf_avg, extend_hdf, create_analysis_infos_avg
+from ledsa.data_extraction.data_integrity import check_intensity_normalization
 
+from importlib.metadata import version
 
 class ExtinctionCoefficients(ABC):
     """
@@ -18,8 +20,10 @@ class ExtinctionCoefficients(ABC):
     :vartype experiment: Experiment
     :ivar reference_property: Reference property to be analysed.
     :vartype reference_property: str
-    :ivar num_ref_imgs: Number of reference images.
+    :ivar num_ref_imgs: Number of reference images. # TODO: create test for this
     :vartype num_ref_imgs: int
+    :ivar ref_img_indices: Indices of reference images to use. If None, use num_ref_imgs.
+    :vartype ref_img_indices: list[int] or None
     :ivar calculated_img_data: DataFrame containing calculated image data.
     :vartype calculated_img_data: pd.DataFrame
     :ivar distances_per_led_and_layer: Array of distances traversed between camera and LEDs in each layer.
@@ -33,7 +37,9 @@ class ExtinctionCoefficients(ABC):
     :ivar solver: Indication whether the calculation is to be carried out numerically or analytically.
     :vartype type: str
     """
-    def __init__(self, experiment, reference_property='sum_col_val', num_ref_imgs=10, average_images=False):
+
+    def __init__(self, experiment, reference_property='sum_col_val', num_ref_imgs=10, ref_img_indices=None,
+                 average_images=False):
         """
         :param experiment: Object representing the experimental setup.
         :type experiment: Experiment
@@ -41,6 +47,8 @@ class ExtinctionCoefficients(ABC):
         :type reference_property: str
         :param num_ref_imgs: Number of reference images.
         :type num_ref_imgs: int
+        :param ref_img_indices: Indices of reference images to use. If None, use num_ref_imgs.
+        :type ref_img_indices: list[int] or None
         :param average_images: Flag to determine if intensities are computed as an average from two consecutive images.
         :type average_images: bool
         """
@@ -48,6 +56,7 @@ class ExtinctionCoefficients(ABC):
         self.experiment = experiment
         self.reference_property = reference_property
         self.num_ref_imgs = num_ref_imgs
+        self.ref_img_indices = ref_img_indices
         self.calculated_img_data = pd.DataFrame()
         self.distances_per_led_and_layer = np.array([])
         self.ref_intensities = np.array([])
@@ -57,7 +66,7 @@ class ExtinctionCoefficients(ABC):
 
     def __str__(self):
         out = str(self.experiment) + \
-              f'reference_property: {self.reference_property}, num_ref_imgs: {self.num_ref_imgs}\n'
+              f'reference_property: {self.reference_property}, num_ref_imgs: {self.num_ref_imgs}, LEDSA {version("ledsa")}\n'
         return out
 
     def calc_and_set_coefficients(self) -> None:
@@ -100,7 +109,8 @@ class ExtinctionCoefficients(ABC):
         """
         if len(self.distances_per_led_and_layer) == 0:
             self.distances_per_led_and_layer = self.calc_distance_array()
-            np.savetxt(f'distances_per_led_and_layer.txt', self.distances_per_led_and_layer)
+            file_name = f'led_array_{self.experiment.led_array}_distances_per_layer.txt'
+            np.savetxt(file_name, self.distances_per_led_and_layer)
         if self.calculated_img_data.empty:
             self.load_img_data()
         if self.ref_intensities.shape[0] == 0:
@@ -131,10 +141,15 @@ class ExtinctionCoefficients(ABC):
             path.mkdir(parents=True)
         path = path / f'extinction_coefficients_{self.solver}_channel_{self.experiment.channel}_{self.reference_property}_led_array_{self.experiment.led_array}.csv'
         header = str(self)
+        header += 'Experiment_Time[s],'
         header += 'layer0'
         for i in range(self.experiment.layers.amount - 1):
             header += f',layer{i + 1}'
-        np.savetxt(path, self.coefficients_per_image_and_layer, delimiter=',', header=header)
+            
+        experiment_times = _get_experiment_times_from_image_infos_file(self.average_images)
+        coefficients_per_time_and_layer = np.column_stack(
+            (experiment_times, self.coefficients_per_image_and_layer))
+        np.savetxt(path, coefficients_per_time_and_layer, delimiter=',', header=header)
 
     def calc_distance_array(self) -> np.ndarray:
         """
@@ -145,7 +160,8 @@ class ExtinctionCoefficients(ABC):
         """
         distances = np.zeros((self.experiment.num_leds, self.experiment.layers.amount))
         count = 0
-        for led in self.experiment.leds:
+        # self.experiment.leds need to be reversed to build the distance array the right way
+        for led in reversed(self.experiment.leds):
             d = self.experiment.calc_traversed_dist_per_layer(led)
             distances[count] = d
             count += 1
@@ -156,10 +172,16 @@ class ExtinctionCoefficients(ABC):
          Calculate and set the reference intensities for all LEDs based on the reference images.
 
          """
-        ref_img_data = self.calculated_img_data.query(f'img_id <= {self.num_ref_imgs}')
-        ref_intensities = ref_img_data.groupby(level='led_id').mean()
+        if self.ref_img_indices is not None:
+            ref_img_data = self.calculated_img_data.query(f'img_id == {self.ref_img_indices}')
+        else:
+            ref_img_data = self.calculated_img_data.query(f'img_id <= {self.num_ref_imgs}')
+        print(
+            f"Images with indices {ref_img_data.index.get_level_values('img_id').unique().values} were used for calculating reference intensities.")
 
-        self.ref_intensities = ref_intensities[self.reference_property].to_numpy()
+        ref_intensities = ref_img_data.groupby(level='led_id')[self.reference_property].mean()
+        check_intensity_normalization(ref_img_data, ref_intensities, self.reference_property)
+        self.ref_intensities = ref_intensities.to_numpy()
 
     def apply_color_correction(self, cc_matrix, on='sum_col_val',
                                nchannels=3) -> None:  # TODO: remove hardcoding of nchannels
@@ -214,3 +236,11 @@ def multiindex_series_to_nparray(multi_series: pd.Series) -> np.ndarray:
     for i in range(num_imgs):
         array[i] = multi_series.loc[i + 1]
     return array
+
+def _get_experiment_times_from_image_infos_file(average_images):
+    if average_images == True:
+        image_infos_file = 'analysis/image_infos_analysis_avg.csv'
+    else:
+        image_infos_file = 'analysis/image_infos_analysis.csv'
+    image_info_df = pd.read_csv(image_infos_file)
+    return image_info_df['Experiment_Time[s]'].to_numpy()
