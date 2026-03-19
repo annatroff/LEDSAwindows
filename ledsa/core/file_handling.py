@@ -136,7 +136,7 @@ def read_hdf(channel: int, path='.') -> pd.DataFrame:
             fit_parameters = pd.read_hdf(file_path, key='/table')
         except (FileNotFoundError, KeyError):
             # If file doesn't exist or neither key works, create new binary data
-            create_binary_data(channel)
+            create_binary_data(channel, path=path)
             fit_parameters = pd.read_hdf(file_path, key='channel_values')
 
     fit_parameters.set_index(['img_id', 'led_id'], inplace=True)
@@ -217,61 +217,68 @@ def extend_hdf(channel: int, quantity: str, values: np.ndarray) -> None:
     fit_parameters.to_hdf(file, key='channel_values', format='table')
 
 
-def create_binary_data(channel: int) -> None:
+def create_binary_data(channel: int, path: str = '.') -> None:
     """
     Creates binary file from the CSV files for a specified channel and writes to an HDF file.
 
     :param channel: Channel number for which binary data is to be created.
     :type channel: int
+    :param path: Root directory of the LEDSA simulation. Defaults to the current directory.
+    :type path: str
     """
-    config = ConfigData()
-    columns = _get_column_names(channel)
+    prev_dir = os.getcwd()
+    try:
+        os.chdir(path)
+        config = ConfigData()
+        columns = _get_column_names(channel)
 
-    fit_params_list = []
+        fit_params_list = []
 
-    fit_params = pd.DataFrame(columns=columns)
+        fit_params = pd.DataFrame(columns=columns)
 
-    # find time and fit parameter for every image
+        # find time and fit parameter for every image
 
-    first_img_id = int(config['analyse_photo']['first_img_analysis_id'])
-    last_img_id = int(config['analyse_photo']['last_img_analysis_id'])
+        first_img_id = int(config['analyse_photo']['first_img_analysis_id'])
+        last_img_id = int(config['analyse_photo']['last_img_analysis_id'])
 
-    if config['DEFAULT']['num_img_overflow'] != 'None':
-        max_id = int(config['DEFAULT']['num_img_overflow'])
-    else:
-        max_id = 10 ** 7
-    number_of_images = (max_id + last_img_id - first_img_id) % max_id + 1
-    number_of_images //= int(config['analyse_photo']['num_skip_imgs']) + 1
-    print('Loading fit parameters...')
-    exception_counter = 0
-    for image_id in range(1, number_of_images + 1):
-        try:
-            in_file_path = os.path.join('analysis', f'channel{channel}', f'{image_id}_led_positions.csv')
-            parameters = ledsa.core.file_handling.read_table(in_file_path, delim=',', silent=True)
-        except (FileNotFoundError, IOError):
-            fit_params_fragment = fit_params.append(
-                _param_array_to_dataframe([[np.nan] * (fit_params.shape[1] - 1)], image_id,
-                                          columns),
-                ignore_index=True, sort=False)
+        if config['DEFAULT']['num_img_overflow'] != 'None':
+            max_id = int(config['DEFAULT']['num_img_overflow'])
+        else:
+            max_id = 10 ** 7
+        number_of_images = (max_id + last_img_id - first_img_id) % max_id + 1
+        number_of_images //= int(config['analyse_photo']['num_skip_imgs']) + 1
+        print('Loading fit parameters...')
+        exception_counter = 0
+        for image_id in range(1, number_of_images + 1):
+            try:
+                in_file_path = os.path.join('analysis', f'channel{channel}', f'{image_id}_led_positions.csv')
+                parameters = ledsa.core.file_handling.read_table(in_file_path, delim=',', silent=True)
+            except (FileNotFoundError, IOError):
+                fit_params_fragment = fit_params.append(
+                    _param_array_to_dataframe([[np.nan] * (fit_params.shape[1] - 1)], image_id,
+                                              columns),
+                    ignore_index=True, sort=False)
+                fit_params_list.append(fit_params_fragment)
+                exception_counter += 1
+                continue
+
+            parameters = parameters[parameters[:, 0].argsort()]  # sort for led_id
+            parameters = _append_coordinates(parameters)
+            fit_params_fragment = _param_array_to_dataframe(parameters, image_id, columns)
             fit_params_list.append(fit_params_fragment)
-            exception_counter += 1
-            continue
 
-        parameters = parameters[parameters[:, 0].argsort()]  # sort for led_id
-        parameters = _append_coordinates(parameters)
-        fit_params_fragment = _param_array_to_dataframe(parameters, image_id, columns)
-        fit_params_list.append(fit_params_fragment)
+        fit_params = pd.concat(fit_params_list, ignore_index=True, sort=False)
 
-    fit_params = pd.concat(fit_params_list, ignore_index=True, sort=False)
-
-    print(f'{number_of_images - exception_counter} of {number_of_images} loaded.')
-    fit_params['img_id'] = fit_params['img_id'].astype(int)
-    fit_params['led_id'] = fit_params['led_id'].astype(int)
-    fit_params['led_array_id'] = fit_params['led_array_id'].astype(int)
-    fit_params['max_col_val'] = fit_params['max_col_val'].astype(int)
-    fit_params['sum_col_val'] = fit_params['sum_col_val'].astype(int)
-    out_file_path = os.path.join('analysis', f'channel{channel}', 'all_parameters.h5')
-    fit_params.to_hdf(out_file_path, key='channel_values', format='table', append=True)
+        print(f'{number_of_images - exception_counter} of {number_of_images} loaded.')
+        fit_params['img_id'] = fit_params['img_id'].astype(int)
+        fit_params['led_id'] = fit_params['led_id'].astype(int)
+        fit_params['led_array_id'] = fit_params['led_array_id'].astype(int)
+        fit_params['max_col_val'] = fit_params['max_col_val'].astype(int)
+        fit_params['sum_col_val'] = fit_params['sum_col_val'].astype(int)
+        out_file_path = os.path.join('analysis', f'channel{channel}', 'all_parameters.h5')
+        fit_params.to_hdf(out_file_path, key='channel_values', format='table', append=True)
+    finally:
+        os.chdir(prev_dir)
 
 def _get_column_names(channel: int) -> List[str]:
     """
