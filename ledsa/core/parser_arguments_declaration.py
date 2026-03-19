@@ -106,4 +106,15 @@ def add_parser_argument_analysis(parser: argparse.ArgumentParser) -> argparse.Ar
                              'the reference property is not already color corrected.')
     parser.add_argument('--cc_channels', default=[0, 1, 2], action='extend', nargs="+", type=int,
                         help='Channels, to which color correcten gets applied. Default 0 1 2')
+    parser.add_argument('-conf_s', '--config_stacked', nargs='?', const='config_stacked.ini', default=None,
+                        metavar='FILENAME',
+                        help='Create a template config_stacked.ini for multi-camera stacked analysis. '
+                             'Optional argument: output filename (default: config_stacked.ini). '
+                             'Use --n_simulations to control the number of simulation blocks.')
+    parser.add_argument('--n_simulations', type=int, default=2,
+                        help='Number of simulation/camera blocks written into the template '
+                             'config_stacked.ini (used with -conf_s). Default: 2.')
+    parser.add_argument('-as', '--analysis_stacked', action='store_true',
+                        help='Run stacked multi-camera extinction coefficient calculation '
+                             'using config_stacked.ini in the current directory.')
     return parser
