@@ -10,6 +10,7 @@ from ledsa.data_extraction.data_integrity import check_intensity_normalization
 
 from importlib.metadata import version
 
+
 class ExtinctionCoefficients(ABC):
     """
     Parent class for the calculation of the Extinction Coefficients.
@@ -103,15 +104,20 @@ class ExtinctionCoefficients(ABC):
         pool.close()
         self.coefficients_per_image_and_layer = sigmas
 
-    def set_all_member_variables(self) -> None:
+    def set_all_member_variables(self, save_distances: bool = True) -> None:
         """
         Calculate distance traveled per layer, for every led, load image data from binary file and calculate reference intensities for each LED
 
+        :param save_distances: If True, write the distance matrix to a text file
+            in the current working directory.  Pass False when calling from a
+            stacked context that manages its own distance file.
+        :type save_distances: bool
         """
         if len(self.distances_per_led_and_layer) == 0:
             self.distances_per_led_and_layer = self.calc_distance_array()
-            file_name = f'led_array_{self.experiment.led_array}_distances_per_layer.txt'
-            np.savetxt(file_name, self.distances_per_led_and_layer)
+            if save_distances:
+                file_name = f'led_array_{self.experiment.led_array}_distances_per_layer.txt'
+                np.savetxt(file_name, self.distances_per_led_and_layer)
         if self.calculated_img_data.empty:
             self.load_img_data()
         if self.ref_intensities.shape[0] == 0:
@@ -152,7 +158,7 @@ class ExtinctionCoefficients(ABC):
         header += 'Experiment_Time[s],'
         header += 'layer0'
         header += ''.join(f',layer{i + 1}' for i in range(self.experiment.layers.amount - 1))
-            
+
         experiment_times = _get_experiment_times_from_image_infos_file(self.average_images)
         coefficients_per_time_and_layer = np.column_stack(
             (experiment_times, self.coefficients_per_image_and_layer))
@@ -243,6 +249,7 @@ def multiindex_series_to_nparray(multi_series: pd.Series) -> np.ndarray:
     for i in range(num_imgs):
         array[i] = multi_series.loc[i + 1]
     return array
+
 
 def _get_experiment_times_from_image_infos_file(average_images):
     if average_images == True:

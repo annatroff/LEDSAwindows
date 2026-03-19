@@ -6,8 +6,10 @@ from ledsa.analysis import ExtinctionCoefficientsNonLinear as ECN
 from ledsa.analysis import ExtinctionCoefficientsLinear as ECA
 
 from ledsa.analysis.ConfigDataAnalysis import ConfigDataAnalysis
+from ledsa.analysis.ConfigDataStacked import ConfigDataStacked
 from ledsa.analysis.Experiment import Experiment
 from ledsa.analysis.ExperimentData import ExperimentData
+from ledsa.analysis.StackedExtinctionCoefficients import StackedExtinctionCoefficients
 from ledsa.analysis.data_preparation import apply_color_correction
 import numpy as np
 
@@ -177,6 +179,56 @@ def run_analysis_arguments(args) -> None:
         ex_data = ExperimentData()
         apply_cc_on_ref_property(ex_data, args.cc_channels)
 
+    if args.config_stacked is not None:
+        ConfigDataStacked.create_template(
+            filename=args.config_stacked,
+            num_simulations=args.n_simulations,
+        )
+
+
+def run_stacked_analysis(args) -> None:
+    """
+    Run stacked multi-camera extinction coefficient calculation.
+
+    Reads ``config_stacked.ini`` from the current working directory, then
+    iterates over every virtual LED-array label and colour channel defined
+    therein, computing and saving the joint extinction coefficients.
+
+    :param args: Parsed command line arguments.
+    :type args: argparse.Namespace
+    """
+    if not args.analysis_stacked:
+        return
+
+    try:
+        open('config_stacked.ini')
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            'config_stacked.ini not found in working directory! '
+            'Create a template with: python -m ledsa -conf_s'
+        )
+
+    cfg = ConfigDataStacked()
+
+    labels = cfg.get_led_array_ids()
+    channels = cfg.camera_channels
+    print(
+        f'Stacked analysis: {len(labels)} LED array(s) × '
+        f'{len(channels)} channel(s), solver={cfg.solver!r}'
+    )
+
+    for led_array_id in labels:
+        for channel in channels:
+            print(f'\n── array={led_array_id}  channel={channel} ──')
+            sec = StackedExtinctionCoefficients(cfg, led_array_id, channel)
+            print(sec)
+            if cfg.num_cores > 1:
+                print(f'Running on {cfg.num_cores} cores.')
+                sec.calc_and_set_coefficients_mp(cfg.num_cores)
+            else:
+                sec.calc_and_set_coefficients()
+            sec.save()
+
 
 def run_analysis_arguments_with_extinction_coefficient(args) -> None:
     """
@@ -185,7 +237,6 @@ def run_analysis_arguments_with_extinction_coefficient(args) -> None:
     :param args: Parsed command line arguments
     :type args: argparse.Namespace
     """
-    run_analysis_arguments(args)
     if args.analysis:
         extionction_coefficient_calculation(args)
 

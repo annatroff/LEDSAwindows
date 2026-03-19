@@ -6,7 +6,7 @@ from typing import List
 from ledsa.core.parser_arguments_declaration import (add_parser_arguments_tools, add_parser_arguments_data_extraction,
     add_parser_arguments_testing, add_parser_arguments_demo, add_parser_argument_analysis)
 from ledsa.core.parser_arguments_run import run_tools_arguments, run_data_extraction_arguments, run_testing_arguments, run_demo_arguments, \
-    run_analysis_arguments, run_analysis_arguments_with_extinction_coefficient
+    run_analysis_arguments, run_analysis_arguments_with_extinction_coefficient, run_stacked_analysis
 
 
 def main(argv: List[str]) -> None:
@@ -40,6 +40,7 @@ def main(argv: List[str]) -> None:
         run_data_extraction_arguments(args)
         run_analysis_arguments(args)
         run_analysis_arguments_with_extinction_coefficient(args)
+        run_stacked_analysis(args)
         run_testing_arguments(args)
 
 
