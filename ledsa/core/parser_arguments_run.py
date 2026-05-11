@@ -1,7 +1,6 @@
 import argparse
 import os
 
-from ledsa.tools.photo_renamer import set_working_dir, get_files, rename_images_by_date
 from ledsa.analysis import ExtinctionCoefficientsNonLinear as ECN
 from ledsa.analysis import ExtinctionCoefficientsLinear as ECA
 
@@ -16,18 +15,6 @@ import numpy as np
 from ledsa.core.ConfigData import ConfigData
 from ledsa.data_extraction.DataExtractor import DataExtractor
 
-
-def run_tools_arguments(args: argparse.Namespace) -> None:
-    """
-    Execute actions based on tools arguments.
-
-    :param args: Parsed command line arguments.
-    :type args: argparse.Namespace
-    """
-    if args.prepare_images:
-        set_working_dir()
-        image_df = get_files()
-        rename_images_by_date(image_df)
 
 
 def run_data_extraction_arguments(args: argparse.Namespace) -> None:

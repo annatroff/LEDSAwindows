@@ -1,19 +1,6 @@
 import argparse
 
 
-def add_parser_arguments_tools(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """
-    Add parser arguments related to tools.
-
-    :param parser: ArgumentParser object to which the arguments are added.
-    :type parser: argparse.ArgumentParser
-    :return: Modified ArgumentParser object with added arguments.
-    :rtype: argparse.ArgumentParser
-    """
-
-    parser.add_argument('--prepare_images', action='store_true')
-    return parser
-
 
 def add_parser_arguments_data_extraction(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """
