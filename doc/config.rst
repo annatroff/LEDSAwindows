@@ -17,3 +17,11 @@ ConfigDataAnalysis
    :members:
    :undoc-members:
    :show-inheritance:
+
+ConfigDataStacked
+-----------------
+
+.. automodule:: ledsa.analysis.ConfigDataStacked
+   :members:
+   :undoc-members:
+   :show-inheritance:

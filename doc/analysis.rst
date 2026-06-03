@@ -25,3 +25,11 @@ Analysis
    :members:
    :undoc-members:
    :show-inheritance:
+
+Stacked Multi-Camera Analysis
+------------------------------
+
+.. automodule:: ledsa.analysis.StackedExtinctionCoefficients
+   :members:
+   :undoc-members:
+   :show-inheritance:

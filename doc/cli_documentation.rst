@@ -1,4 +1,3 @@
-
 CLI Documentation
 =================
 
@@ -67,6 +66,26 @@ Analysis
 
 .. warning::
     Color Correction is in a test state and has not yet been sufficiently evaluated. The application may lead to incorrect results.
+
+Stacked Multi-Camera Analysis
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. list-table::
+   :widths: 20 50 30
+   :header-rows: 1
+
+   * - Argument
+     - Description
+     - Options
+   * - ``-conf_s [FILENAME]``, ``--config_stacked [FILENAME]``
+     - Create a template ``config_stacked.ini`` for multi-camera stacked analysis. The optional argument sets the output filename (default: ``config_stacked.ini``).
+     - ``--n_simulations N`` sets the number of simulation blocks in the template (default: 2).
+   * - ``--n_simulations N``
+     - Number of ``[simulation_N]`` blocks written into the template ``config_stacked.ini``. Only used together with ``-conf_s``.
+     - Default: 2
+   * - ``-as``, ``--analysis_stacked``
+     - Run the stacked multi-camera extinction coefficient calculation using ``config_stacked.ini`` in the current directory.
+     - --
 
 Coordinates
 ^^^^^^^^^^^
