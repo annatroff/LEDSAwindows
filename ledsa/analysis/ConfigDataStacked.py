@@ -306,6 +306,6 @@ class ConfigDataStacked(cp.ConfigParser):
         cfg['led_arrays']['0'] = '0:0 1:0'
         cfg['led_arrays']['1'] = '0:1 1:1'
 
-        with open(filename, 'w') as f:
+        with open(filename, 'w', encoding='utf-8') as f:
             cfg.write(f)
         print(f'Template written to {filename}')
