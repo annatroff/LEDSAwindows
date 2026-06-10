@@ -19,11 +19,13 @@ def read_channel_data_from_img(filename: str, channel: int) -> np.ndarray:
     :return: A 2D array containing the processed image data for one channel.
     :rtype: np.ndarray
     """
-    extension = os.path.splitext(filename)[-1]
-    if extension in ['.JPG', '.JPEG', '.jpg', '.jpeg', '.PNG', '.png']:
+    extension = os.path.splitext(filename)[-1].lower()
+    if extension in ['.jpg', '.jpeg', '.png']:
         channel_array = _read_channel_data_from_img_file(filename, channel)
-    elif extension in ['.CR2', '.CR3','.ARW','.NEF']:
+    elif extension in ['.cr2', '.cr3', '.arw', '.nef']:
         channel_array = _read_channel_data_from_raw_file(filename, channel)
+    else:
+        raise ValueError(f"Unsupported image file extension: {extension}")
     return channel_array
 
 def read_img_array_from_img(filename: str, channel: int) -> np.ndarray:
@@ -38,11 +40,13 @@ def read_img_array_from_img(filename: str, channel: int) -> np.ndarray:
     :return: A 2D array containing the processed image data for all color channels.
     :rtype: np.ndarray
     """
-    extension = os.path.splitext(filename)[-1]
-    if extension in ['.JPG', '.JPEG', '.jpg', '.jpeg', '.PNG', '.png']:
+    extension = os.path.splitext(filename)[-1].lower()
+    if extension in ['.jpg', '.jpeg', '.png']:
         img_array = _read_grayscale_img_array_from_img_file(filename)
-    elif extension in ['.CR2', '.CR3']:
+    elif extension in ['.cr2', '.cr3', '.arw', '.nef']:
         img_array, _ = _read_img_array_from_raw_file(filename, channel)
+    else:
+        raise ValueError(f"Unsupported image file extension: {extension}")
     return img_array
 
 
