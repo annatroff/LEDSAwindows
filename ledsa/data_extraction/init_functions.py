@@ -1,9 +1,10 @@
 import os
-from datetime import timedelta, datetime
+from datetime import timedelta
 from typing import List
 
 from ledsa.core.ConfigData import ConfigData
-from ledsa.core.image_reading import get_exif_entry
+from ledsa.core.image_integrity import CorruptedImageError, report_corrupted_images
+from ledsa.core.image_reading import get_exif_datetime
 
 
 def create_needed_directories(channels: List[int]) -> None:
@@ -80,6 +81,8 @@ def generate_image_infos_csv(config: ConfigData, build_experiment_infos=False, b
     :type build_experiment_infos: bool
     :param build_analysis_infos: Whether to build CSV for analysis info.
     :type build_analysis_infos: bool
+    :raises RuntimeError: If the first image of the experiment or none of the images of the configured ID
+                          range could be read.
     """
     config_switch = []
     if build_experiment_infos:
@@ -88,7 +91,14 @@ def generate_image_infos_csv(config: ConfigData, build_experiment_infos=False, b
         config_switch.append('analyse_photo')
     for build_type in config_switch:
         if config['DEFAULT']['start_time'] == 'None':
-            config.get_start_time()
+            try:
+                config.get_start_time()
+            except CorruptedImageError as error:
+                # Every experiment time is measured from the first image, so it cannot be skipped
+                report_corrupted_images([error], 'reading of the experiment start time')
+                raise RuntimeError(f'The start time of the experiment cannot be read, because '
+                                   f'{error.img_filename} could not be read. Set start_time in config.ini '
+                                   f'manually or point first_img_experiment_id at a readable image.') from error
             config.save()
         img_data = _build_img_data_string(build_type, config)
 
@@ -113,36 +123,15 @@ def _calc_experiment_and_real_time(build_type: str, config: ConfigData, tag: str
     :return: Tuple containing experiment time and real time.
     :rtype: tuple
     """
-    exif_entry = get_exif_entry(os.path.join(config['DEFAULT']['img_directory'],
-                                config['DEFAULT']['img_name_string'].format(img_number)), tag)
-    date, time_meta = exif_entry.split(' ')
-    date_time_img = _get_datetime_from_str(date, time_meta)
+    img_path = os.path.join(config['DEFAULT']['img_directory'],
+                            config['DEFAULT']['img_name_string'].format(int(img_number)))
+    date_time_img = get_exif_datetime(img_path, tag)
 
     experiment_time = date_time_img - config.get_datetime()
     experiment_time = experiment_time.total_seconds()
-    time_diff = config[build_type]['exif_time_infront_real_time'].split('.')
-    if len(time_diff) == 1:
-        time_diff.append('0')
-    time = date_time_img - timedelta(seconds=int(time_diff[0]), milliseconds=int(time_diff[1]))
+    time_diff = config.getfloat(build_type, 'exif_time_infront_real_time')
+    time = date_time_img - timedelta(seconds=time_diff)
     return experiment_time, time
-
-
-def _get_datetime_from_str(date: str, time: str) -> datetime:
-    """
-    Convert date and time strings to a datetime object.
-
-    :param date: Date string in the format '%Y:%m:%d' or '%d.%m.%Y'.
-    :type date: str
-    :param time: Time string in the format '%H:%M:%S'.
-    :type time: str
-    :return: Corresponding datetime object.
-    :rtype: datetime.datetime
-    """
-    if date.find(":") != -1:
-        date_time = datetime.strptime(date + ' ' + time, '%Y:%m:%d %H:%M:%S')
-    else:
-        date_time = datetime.strptime(date + ' ' + time, '%d.%m.%Y %H:%M:%S')
-    return date_time
 
 
 def _find_img_number_list(first: int, last: int, increment: int, number_string_length=4) -> List[str]:
@@ -173,6 +162,49 @@ def _find_img_number_list(first: int, last: int, increment: int, number_string_l
     return num_list
 
 
+def _insert_ref_img_ids(img_id_list: List[str], ref_img_experiment_ids: List[int], first: int,
+                        number_string_length=4) -> List[str]:
+    """
+    Add the images used for normalization to the list of the images that are analysed.
+
+    num_skip_imgs thins out the analysed images, which would pull the reference images apart in
+    time and let I0 reach into the fire. The images named in ref_img_experiment_ids are therefore
+    analysed whatever the increment leaves out. They are inserted in the order they were taken,
+    so the analysis IDs stay a gapless sequence that follows the time axis.
+
+    :param img_id_list: Image IDs the increment selected, in the order they were taken.
+    :type img_id_list: List[str]
+    :param ref_img_experiment_ids: Experiment IDs of the images used for normalization.
+    :type ref_img_experiment_ids: List[int]
+    :param first: Experiment ID of the first analysed image, the order is counted from.
+    :type first: int
+    :param number_string_length: Number of digits in the image ID (default is 4).
+    :type number_string_length: int
+    :return: Image IDs of the analysed images, in the order they were taken.
+    :rtype: List[str]
+    :raises ValueError: If a reference image lies outside the analysed image range.
+    """
+    if not ref_img_experiment_ids:
+        return img_id_list
+    # the IDs can run over the largest number the file names hold and start at 1 again, so the
+    # order is counted from the first image instead of comparing the IDs themselves
+    cycle = 10 ** number_string_length
+
+    def position(img_id) -> int:
+        return (int(img_id) - first) % cycle
+
+    last_position = position(img_id_list[-1])
+    img_ids = {int(img_id): img_id for img_id in img_id_list}
+    outside = [img_id for img_id in ref_img_experiment_ids if position(img_id) > last_position]
+    if outside:
+        raise ValueError(f'The reference images {outside} of ref_img_experiment_ids in config.ini lie '
+                         f'outside the analysed images {img_id_list[0]} to {img_id_list[-1]}. Widen '
+                         f'that range in config.ini or name other images for the normalization.')
+    for img_id in ref_img_experiment_ids:
+        img_ids.setdefault(int(img_id), str(img_id).zfill(number_string_length))
+    return [img_ids[img_id] for img_id in sorted(img_ids, key=position)]
+
+
 def _build_img_data_string(build_type: str, config: ConfigData) -> str:
     """
     Construct image data string for CSV generation.
@@ -186,10 +218,11 @@ def _build_img_data_string(build_type: str, config: ConfigData) -> str:
     """
     img_data = ''
     img_idx = 1
+    corrupted_images = []
     if config['analyse_photo']['first_img_analysis_id'] == 'None':
         config.in_first_img_analysis_id()
         config.save()
-    first_img_id = config.getint(build_type, 'first_img_experiment_id')
+    first_img_id = config.getint(build_type, 'first_img_experiment_id' if build_type == 'DEFAULT' else 'first_img_analysis_id')
 
     if config['analyse_photo']['last_img_analysis_id'] == 'None':
         config.in_last_img_analysis_id()
@@ -198,12 +231,27 @@ def _build_img_data_string(build_type: str, config: ConfigData) -> str:
 
     img_increment = config.getint(build_type, 'num_skip_imgs') + 1 if build_type == 'analyse_photo' else 1
     img_id_list = _find_img_number_list(first_img_id, last_img_id, img_increment)
+    if build_type == 'analyse_photo':
+        # image_infos.csv of the experiment holds every image anyway, only the analysed ones are
+        # thinned out and can lose a reference image
+        img_id_list = _insert_ref_img_ids(img_id_list, config.get_ref_img_experiment_ids(),
+                                          first_img_id)
     for img_id in img_id_list:
-        tag = 'EXIF:DateTimeOriginal'
-        experiment_time, time = _calc_experiment_and_real_time(build_type, config, tag, img_id)
-        img_data += (str(img_idx) + ',' + config[build_type]['img_name_string'].format(img_id) +
-                     ',' + time.strftime('%H:%M:%S') + ',' + str(experiment_time) + '\n')
+        tag = 'DateTimeOriginal'
+        try:
+            experiment_time, time = _calc_experiment_and_real_time(build_type, config, tag, img_id)
+        except CorruptedImageError as error:
+            # Leaving the image out here already excludes it from every following step, while the IDs of the
+            # readable images stay a gapless sequence, which the result file headers rely on.
+            corrupted_images.append(error)
+            continue
+        img_data += (str(img_idx) + ',' + config[build_type]['img_name_string'].format(int(img_id)) +
+                     ',' + time.strftime('%H:%M:%S.%f')[:-3] + ',' + str(experiment_time) + '\n')
         img_idx += 1
+    report_corrupted_images(corrupted_images, 'reading of the image metadata')
+    if img_idx == 1:
+        raise RuntimeError(f'None of the {len(img_id_list)} images between the IDs {first_img_id} and '
+                           f'{last_img_id} could be read. Check img_directory and img_name_string in config.ini.')
     return img_data
 
 
@@ -215,7 +263,7 @@ def _save_analysis_infos(img_data: str) -> None:
     :type img_data: str
     """
     file_path = os.path.join('analysis', 'image_infos_analysis.csv')
-    out_file = open(file_path, 'w')
+    out_file = open(file_path, 'w', encoding='utf-8')
     out_file.write("#ID,Name,Time[s],Experiment_Time[s]\n")
     out_file.write(img_data)
     out_file.close()
@@ -228,7 +276,7 @@ def _save_experiment_infos(img_data: str) -> None:
     :param img_data: Formatted string containing image data.
     :type img_data: str
     """
-    out_file = open('image_infos.csv', 'w')
+    out_file = open('image_infos.csv', 'w', encoding='utf-8')
     out_file.write("#Count,Name,Time[s],Experiment_Time[s]\n")
     out_file.write(img_data)
     out_file.close()

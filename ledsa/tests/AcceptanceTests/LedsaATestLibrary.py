@@ -1,9 +1,13 @@
+import glob
 import os
+import re
+import shutil
+import warnings
 from subprocess import Popen, PIPE
 
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy.random import normal
+import pandas as pd
 import exiv2
 from PIL import Image
 from robot.api.deco import keyword, library
@@ -14,6 +18,17 @@ from TestExperiment import TestExperiment, Layers, Camera
 from ledsa.analysis.ConfigDataAnalysis import ConfigDataAnalysis
 from ledsa.analysis.ConfigDataStacked import ConfigDataStacked
 from ledsa.core.ConfigData import ConfigData
+from ledsa.core.image_integrity import CORRUPTED_IMAGES_FILE_PATH, load_corrupted_images
+from ledsa.postprocessing.simulation import SimData
+
+# The noise put on the synthetic extinction coefficients is as large as the RMSE the tests
+# accept, so drawing it afresh every run made them pass or fail by chance. A fixed seed keeps
+# the test data, and with it the reconstruction error, the same on every run and platform.
+NOISE_SEED = 20181127
+
+# Number of consecutive images LEDSA summarizes into one when average_images is set. Spelled out
+# here instead of taken from ledsa, so that the test checks the documented behaviour.
+NUM_IMGS_PER_AVERAGE = 2
 
 
 @library
@@ -24,7 +39,7 @@ class LedsaATestLibrary:
         os.chdir(new_dir)
 
     @keyword
-    def create_test_data(self, num_of_leds=100, num_of_layers=20, bottom_border=0, top_border=3):
+    def create_test_data(self, num_of_leds=100, num_of_layers=20, bottom_border=0, top_border=3, background=0):
         # Create test_data directory if it doesn't exist
         if not os.path.exists('test_data'):
             os.makedirs('test_data')
@@ -37,9 +52,10 @@ class LedsaATestLibrary:
 
         EPS = 1e-10  # guarantees strictly positive output
         SIGMA_NOISE = 0.05
+        rng = np.random.default_rng(NOISE_SEED)
 
         def _add_noise(x, *, sigma=SIGMA_NOISE):
-            return np.clip(x + normal(0, sigma, x.shape), a_min=0.0, a_max=None) + EPS
+            return np.clip(x + rng.normal(0, sigma, x.shape), a_min=0.0, a_max=None) + EPS
 
         def extco_const_initial(z):
             # start from a tiny positive floor instead of 0 to avoid log(0)
@@ -65,14 +81,15 @@ class LedsaATestLibrary:
             for z in np.linspace(bottom_border + 0.05, top_border - 0.05, num_of_leds):
                 ex.add_led(0, 4, z)
             ex.set_extinction_coefficients(extinction_coefficients)
-            create_test_image(image_id, ex)
+            create_test_image(image_id, ex, background=int(background))
 
     # ------------------------------------------------------------------
     # Stacked / multi-camera keywords
     # ------------------------------------------------------------------
 
     @keyword
-    def create_test_data_stacked(self, num_of_leds=100, num_of_layers=20, bottom_border=0, top_border=3):
+    def create_test_data_stacked(self, num_of_leds=100, num_of_layers=20, bottom_border=0, top_border=3,
+                                 num_extra_ref_images=0):
         """Create test images for two cameras at different heights.
 
         Directory layout created under the current working directory::
@@ -81,14 +98,19 @@ class LedsaATestLibrary:
               test_data/          ← ground-truth extinction coefficient CSVs
               cam0/test_data/     ← images as seen from the lower camera
               cam1/test_data/     ← images as seen from the upper camera
+
+        :param num_extra_ref_images: Number of near-zero images appended behind the four
+            profiles. They are copies of the reference image, so each of them can serve as the
+            reference image of a single camera.
         """
         z_range = np.linspace(bottom_border, top_border, num_of_layers)
 
         EPS = 1e-10
         SIGMA_NOISE = 0.05
+        rng = np.random.default_rng(NOISE_SEED)
 
         def _add_noise(x, *, sigma=SIGMA_NOISE):
-            return np.clip(x + normal(0, sigma, x.shape), a_min=0.0, a_max=None) + EPS
+            return np.clip(x + rng.normal(0, sigma, x.shape), a_min=0.0, a_max=None) + EPS
 
         profiles = [
             np.full_like(z_range, EPS),              # image 1 – reference (near-zero)
@@ -96,6 +118,9 @@ class LedsaATestLibrary:
             _add_noise(0.15 * z_range),              # image 3 – linear
             _add_noise(0.0435 * z_range ** 2),       # image 4 – quadratic
         ]
+        # The noise of the four profiles is drawn before this, so the test data of a run without
+        # extra reference images stays the same
+        profiles += [np.full_like(z_range, EPS)] * int(num_extra_ref_images)
 
         # Save ground-truth extinction coefficients once (shared by both cameras)
         gt_dir = os.path.join('stacked', 'test_data')
@@ -164,11 +189,18 @@ class LedsaATestLibrary:
         conf.save()
 
     @keyword
-    def create_and_fill_config_stacked(self, cam0_dir, cam1_dir):
+    def create_and_fill_config_stacked(self, cam0_dir, cam1_dir, time_sync_tolerance=2,
+                                       cam0_ref_img_indices=None, cam1_ref_img_indices=None):
         """Create config_stacked.ini in the current directory.
 
         *cam0_dir* and *cam1_dir* are paths (absolute or relative to the
         current working directory) to the two camera simulation directories.
+        *time_sync_tolerance* is the time [s] within which images of different
+        cameras are treated as simultaneous.
+
+        :param cam0_ref_img_indices: Reference image IDs written into ``[simulation_0]``,
+            e.g. ``'1'``. The camera inherits the setting of ``[DEFAULT]`` if None.
+        :param cam1_ref_img_indices: Reference image IDs written into ``[simulation_1]``.
         """
         cfg = ConfigDataStacked(load_config_file=False)
         cfg['DEFAULT']['solver']             = 'linear'
@@ -177,20 +209,25 @@ class LedsaATestLibrary:
         cfg['DEFAULT']['num_ref_images']     = '1'
         cfg['DEFAULT']['ref_img_indices']    = 'None'
         cfg['DEFAULT']['average_images']     = 'False'
+        cfg['DEFAULT']['n_summarize']        = '2'
         cfg['DEFAULT']['camera_channels']    = '0'
         cfg['DEFAULT']['num_cores']          = '1'
         cfg['DEFAULT']['num_layers']         = '20'
         cfg['DEFAULT']['domain_bounds']      = '0 3'
         cfg['DEFAULT']['output_path']        = '.'
-        cfg['DEFAULT']['time_sync_tolerance'] = '2'
+        cfg['DEFAULT']['time_sync_tolerance'] = str(time_sync_tolerance)
 
         cfg['simulation_0'] = {}
         cfg['simulation_0']['path']            = str(os.path.abspath(cam0_dir))
         cfg['simulation_0']['camera_position'] = '0 0 0.5'
+        if cam0_ref_img_indices is not None:
+            cfg['simulation_0']['ref_img_indices'] = str(cam0_ref_img_indices)
 
         cfg['simulation_1'] = {}
         cfg['simulation_1']['path']            = str(os.path.abspath(cam1_dir))
         cfg['simulation_1']['camera_position'] = '0 0 2.5'
+        if cam1_ref_img_indices is not None:
+            cfg['simulation_1']['ref_img_indices'] = str(cam1_ref_img_indices)
 
         cfg['led_arrays'] = {}
         cfg['led_arrays']['0'] = '0:0 1:0'
@@ -200,11 +237,7 @@ class LedsaATestLibrary:
     @keyword
     def plot_stacked_input_vs_computed_extinction_coefficients(self, solver='linear', first=2, last=4, led_array_id=0, channel=0):
         """Plot input vs stacked-computed extinction coefficients for each test image."""
-        filename = (
-            f'extinction_coefficients_{solver}_channel_{channel}'
-            f'_sum_col_val_led_array_{led_array_id}.csv'
-        )
-        result_path = os.path.join('analysis', 'extinction_coefficients', solver, filename)
+        result_path = extinction_coefficients_path(solver, channel, led_array_id)
         data = np.loadtxt(result_path, delimiter=',', skiprows=4)
         times = data[:, 0]
         extco_computed = data[:, 1:]
@@ -233,11 +266,7 @@ class LedsaATestLibrary:
     @keyword
     def check_stacked_input_vs_computed(self, image_id, solver='linear', led_array_id=0, channel=0):
         """Return the RMSE between the stacked reconstruction and the ground truth."""
-        filename = (
-            f'extinction_coefficients_{solver}_channel_{channel}'
-            f'_sum_col_val_led_array_{led_array_id}.csv'
-        )
-        result_path = os.path.join('analysis', 'extinction_coefficients', solver, filename)
+        result_path = extinction_coefficients_path(solver, channel, led_array_id)
         data = np.loadtxt(result_path, delimiter=',', skiprows=4)
         extco_computed = data[:, 1:]   # first column is experiment time
 
@@ -247,6 +276,95 @@ class LedsaATestLibrary:
         row = int(image_id) - 1
         rmse = np.sqrt(np.mean((extco_input - extco_computed[row, :]) ** 2))
         return rmse
+
+    @keyword
+    def stacked_analysis_should_exclude_image(self, sim_dir, img_name, solver='linear', channel=0,
+                                              led_array_id=0, reference_property='sum_col_val'):
+        """Fail unless the stacked result covers every image of a simulation except the given one.
+
+        Both camera simulations see the same images at the same experiment times, so the common time
+        axis is expected to hold all of them but the time of the image that was skipped.
+
+        :param sim_dir: Directory of the simulation the image was skipped in.
+        :param img_name: Name of the image inside the test_data directory of that simulation.
+        """
+        infos_path = os.path.join(sim_dir, 'analysis', 'image_infos_analysis.csv')
+        times_of_img = read_experiment_times_of_images(infos_path)
+        if img_name not in times_of_img:
+            raise AssertionError(f'{img_name} is not listed in {infos_path}')
+        expected = sorted(round(t, 6) for name, t in times_of_img.items() if name != img_name)
+
+        times, extinction_coefficients = load_stacked_extinction_coefficients_computed(
+            solver, channel, led_array_id, reference_property)
+        computed = [round(float(t), 6) for t in times]
+        if computed != expected:
+            raise AssertionError(f'Common experiment times of the stacked result are {computed}, '
+                                 f'expected {expected}')
+        if np.isnan(extinction_coefficients).any():
+            raise AssertionError('The stacked result contains NaN extinction coefficients')
+
+    @keyword
+    def stacked_analysis_should_report_reference_images(self, output, *reported_indices):
+        """Fail unless the stacked analysis reported every given list of reference images.
+
+        Every camera computes its reference intensities on its own, so every one of them
+        reports the images it used.
+
+        :param output: Return value of ``Execute Ledsa``, i.e. the output of the run.
+        :param reported_indices: Reference image lists as they are printed, e.g. ``[1]``.
+        """
+        stdout = output[0].decode('utf-8')
+        for indices in reported_indices:
+            line = (f'Images with indices {indices} were used for calculating '
+                    f'reference intensities.')
+            if line not in stdout:
+                raise AssertionError(f'The stacked analysis did not report "{line}". '
+                                     f'Its output was:\n{stdout}')
+
+    @keyword
+    def stacked_result_header_should_name_reference_images(self, expected, solver='linear',
+                                                          channel=0, led_array_id=0,
+                                                          reference_property='sum_col_val'):
+        """Fail unless the header of the stacked result names the given reference images.
+
+        :param expected: Expected description of the reference images of all simulations,
+            e.g. ``sim0 [1], sim1 [5]``.
+        """
+        path = extinction_coefficients_path(solver, channel, led_array_id, reference_property)
+        with open(path, encoding='utf-8') as result_file:
+            header = result_file.readline().strip()
+        if f'ref_imgs: {expected}' not in header:
+            raise AssertionError(f'The header of {path} does not name the reference images '
+                                 f'"{expected}": {header}')
+
+    @keyword
+    def check_stacked_input_vs_computed_at_image_time(self, sim_dir, image_id, solver='linear',
+                                                      led_array_id=0, channel=0):
+        """Return the RMSE between the ground truth of an image and the result at its experiment time.
+
+        The row is looked up by experiment time, because an image left out of the common time axis
+        shifts every row behind it.
+
+        :param sim_dir: Directory of the simulation the image times are read from.
+        :param image_id: ID of the test image, which is also the ID of its ground truth file.
+        """
+        infos_path = os.path.join(sim_dir, 'analysis', 'image_infos_analysis.csv')
+        img_name = f'test_img_{int(image_id)}.jpg'
+        times_of_img = read_experiment_times_of_images(infos_path)
+        if img_name not in times_of_img:
+            raise AssertionError(f'{img_name} is not listed in {infos_path}')
+
+        times, extco_computed = load_stacked_extinction_coefficients_computed(
+            solver, channel, led_array_id)
+        # The experiment times are seconds since an epoch, so they have to be compared absolutely
+        rows = np.flatnonzero(np.isclose(times, times_of_img[img_name], rtol=0, atol=1e-6))
+        if len(rows) != 1:
+            raise AssertionError(f'{img_name} has the experiment time {times_of_img[img_name]} s, which '
+                                 f'matches {len(rows)} of the computed times {list(times)}')
+
+        gt_path = os.path.join('test_data', f'test_extinction_coefficients_input_{int(image_id)}.csv')
+        extco_input = np.loadtxt(gt_path)
+        return float(np.sqrt(np.mean((extco_input - extco_computed[rows[0], :]) ** 2)))
 
     @keyword
     def plot_input_vs_computed_extinction_coefficients(self, solver, first=1, last=4, led_array=0, channel=0):
@@ -270,8 +388,10 @@ class LedsaATestLibrary:
             plt.close()
 
     @keyword
-    def check_input_vs_computed_extinction_coefficients(self, image_id, solver, led_array=0, channel=0):
-        _, extinction_coefficients_computed = load_extinction_coefficients_computed(solver, channel, led_array)
+    def check_input_vs_computed_extinction_coefficients(self, image_id, solver, led_array=0, channel=0,
+                                                        reference_property='sum_col_val'):
+        _, extinction_coefficients_computed = load_extinction_coefficients_computed(solver, channel, led_array,
+                                                                                    reference_property)
         extinction_coefficients_input = np.loadtxt(os.path.join('test_data', f'test_extinction_coefficients_input_{image_id}.csv'), delimiter=',')
         rmse = np.sqrt(
             np.mean((extinction_coefficients_input - extinction_coefficients_computed[int(image_id) - 1, :]) ** 2))
@@ -297,13 +417,21 @@ class LedsaATestLibrary:
         conf.save()
 
     @keyword
-    def create_and_fill_config_analysis(self, solver):
+    def create_and_fill_config_analysis(self, solver, reference_property='sum_col_val', num_ref_images=1,
+                                        average_images=False, n_summarize=2):
+        """Write config_analysis.ini. num_ref_images lets a test take the reference from another image than the first.
+
+        :param average_images: Summarize the images after the reference images.
+        :param n_summarize: Number of consecutive images summarized into one.
+        """
+        average_images = str(average_images).lower() == 'true'
         conf = ConfigDataAnalysis(load_config_file=False, camera_position=None, num_layers=20, domain_bounds=None,
-                                  led_array_indices=0, num_ref_images=1, camera_channels=0, num_cores=1,
-                                  reference_property='sum_col_val',
-                                  average_images=False, solver=solver, weighting_preference=-6e-4,
-                                  weighting_curvature=1e-7,
-                                  num_iterations=2000, lambda_reg=1e-3)
+                                  led_array_indices=0, num_ref_images=int(num_ref_images), camera_channels=0,
+                                  num_cores=1, reference_property=reference_property,
+                                  average_images=average_images, n_summarize=int(n_summarize), solver=solver,
+                                  weighting_preference=-6e-3,
+                                  weighting_curvature=1e-2,
+                                  num_iterations=1000, lambda_reg=1e-3)
         conf.set('experiment_geometry', '   camera_position', '0 0 2')
         conf.set('model_parameters', '   domain_bounds', '0 3')
         conf.save()
@@ -317,7 +445,11 @@ class LedsaATestLibrary:
             inp = b'test_data/\ntest_img_{}.jpg\n1\n12:00:00\n1\n1000\n1\n1\n1'
             out = self.execute_ledsa('-s1', inp)
             check_error_msg(out)
-        return out[0].decode('utf-8')[-9:-6]
+        stdout = out[0].decode('utf-8')
+        leds_found = re.search(r'Found (\d+) LEDS', stdout)
+        if leds_found is None:
+            raise AssertionError(f'step 1 did not report a number of LEDs: {stdout[-200:]!r}')
+        return leds_found.group(1)
 
     @keyword
     def execute_ledsa(self, arg, inp=None):
@@ -326,20 +458,328 @@ class LedsaATestLibrary:
         return out
 
     @keyword
+    def execute_ledsa_expecting_failure(self, arg):
+        """Run ledsa and return its stderr, for a run that is supposed to stop with an error.
+
+        execute_ledsa hands its output to check_error_msg, which aborts the whole suite as soon as
+        anything reaches stderr, so a test of a reported error cannot go through it.
+        """
+        returncode, stderr = run_ledsa_capturing_stderr(arg)
+        if returncode == 0:
+            raise AssertionError(f'ledsa {arg} succeeded, but it was expected to stop with an error.')
+        return stderr
+
+    @keyword
+    def execute_ledsa_expecting_warning(self, arg):
+        """Run ledsa to completion and return its stderr, for a run that is supposed to warn.
+
+        A warning reaches stderr as well, which execute_ledsa would treat as a failed suite.
+        """
+        returncode, stderr = run_ledsa_capturing_stderr(arg)
+        if returncode != 0:
+            raise AssertionError(f'ledsa {arg} stopped with an error:\n{stderr}')
+        return stderr
+
+    @keyword
     def create_cc_matrix_file(self):
-        file = open("mean_all_cc_matrix_integral.csv", "w")
+        file = open("mean_all_cc_matrix_integral.csv", "w", encoding="utf-8")
         file.write("2,3,4\n1,2,7\n3,4,5")
         file.close()
 
-def load_extinction_coefficients_computed(solver, channel, led_array):
-    filename = f'extinction_coefficients_{solver}_channel_{channel}_sum_col_val_led_array_{led_array}.csv'
+    @keyword
+    def strip_bgsub_column_from_led_position_files(self, channel=0, num_columns=5):
+        """Keep only the first num_columns columns of the step 3 output files to simulate data extracted with
+        an older ledsa version (5: prior to the local background subtraction). The column header is shortened
+        accordingly."""
+        num_columns = int(num_columns)
+        pattern = os.path.join('analysis', f'channel{channel}', '*_led_positions.csv')
+        for path in glob.glob(pattern):
+            with open(path, encoding='utf-8') as file:
+                lines = file.readlines()
+            with open(path, 'w', encoding='utf-8') as file:
+                for line in lines:
+                    if line.startswith('# id,line,'):
+                        file.write(','.join(line.strip().split(',')[:num_columns]) + '\n')
+                    elif not line.strip() or line.lstrip().startswith('#'):
+                        file.write(line)
+                    else:
+                        file.write(','.join(line.strip().split(',')[:num_columns]) + '\n')
+
+    @keyword
+    def check_extinction_coefficient_files_are_identical(self, file_a, file_b):
+        data_a = np.loadtxt(file_a, delimiter=',')
+        data_b = np.loadtxt(file_b, delimiter=',')
+        return bool(np.array_equal(data_a, data_b))
+
+    @keyword
+    def corrupt_image(self, img_name, mode='truncate'):
+        """Damage a test image and keep a backup, so that it can be restored afterwards.
+
+        :param img_name: Name of the image inside the test_data directory.
+        :param mode: 'truncate' cuts the file in half, which leaves the EXIF metadata readable but breaks
+                     the pixel data. 'garbage' replaces the content, which breaks both.
+        """
+        img_path = os.path.join('test_data', img_name)
+        backup_path = img_path + '.backup'
+        if not os.path.exists(backup_path):
+            shutil.copyfile(img_path, backup_path)
+        if mode == 'truncate':
+            content = open(backup_path, 'rb').read()
+            with open(img_path, 'wb') as img_file:
+                img_file.write(content[:len(content) // 2])
+        elif mode == 'garbage':
+            with open(img_path, 'wb') as img_file:
+                img_file.write(b'this is not an image' * 20)
+        else:
+            raise ValueError(f'Unknown corruption mode {mode}')
+
+    @keyword
+    def restore_corrupted_images(self):
+        """Restore all images damaged by 'Corrupt Image' and remove the report of the corrupted images."""
+        for backup_path in glob.glob(os.path.join('test_data', '*.backup')):
+            shutil.move(backup_path, backup_path[:-len('.backup')])
+        if os.path.exists(CORRUPTED_IMAGES_FILE_PATH):
+            os.remove(CORRUPTED_IMAGES_FILE_PATH)
+
+    @keyword
+    def get_corrupted_images_report(self):
+        """Read the report of the corrupted images as a list of dictionaries."""
+        return load_corrupted_images()
+
+    @keyword
+    def corrupted_images_report_should_list(self, img_name, analysis_step):
+        """Fail unless the report lists the image for the given analysis step.
+
+        :param img_name: Name of the image inside the test_data directory.
+        :param analysis_step: Analysis step that is expected to have skipped the image.
+        """
+        rows = load_corrupted_images()
+        img_path = os.path.join('test_data', img_name)
+        for row in rows:
+            if (os.path.normpath(row['image_path']) == os.path.normpath(img_path)
+                    and row['analysis_step'] == analysis_step):
+                if not row['error_type'] or not row['error_message']:
+                    raise AssertionError(f'{img_path} is listed without a reason: {row}')
+                return
+        raise AssertionError(f'{img_path} is not listed for "{analysis_step}". Report contains: {rows}')
+
+    @keyword
+    def analysis_should_exclude_image(self, img_name, solver='linear', channel=0, led_array=0,
+                                      reference_property='sum_col_val'):
+        """Fail unless the extinction coefficients cover every analysed image except the given one.
+
+        Checks that the skipped image contributes no row and, more importantly, that the remaining rows are
+        still paired with the experiment time of their own image instead of being shifted by one.
+        """
+        infos_path = os.path.join('analysis', 'image_infos_analysis.csv')
+        times_of_img = read_experiment_times_of_images(infos_path)
+        if img_name not in times_of_img:
+            raise AssertionError(f'{img_name} is not listed in {infos_path}')
+
+        file_path = extinction_coefficients_path(solver, channel, led_array, reference_property)
+        filename = os.path.basename(file_path)
+        data = np.atleast_2d(np.genfromtxt(file_path, delimiter=',', comments='#'))
+        times = [round(t, 6) for t in data[:, 0]]
+
+        expected = sorted(round(t, 6) for name, t in times_of_img.items() if name != img_name)
+        if times != expected:
+            raise AssertionError(f'Experiment times in {filename} are {times}, expected {expected}')
+        if np.isnan(data[:, 1:]).any():
+            raise AssertionError(f'{filename} contains NaN extinction coefficients')
+
+    @keyword
+    def averaged_analysis_should_summarize_the_images(self, num_ref_images=1, solver='linear', channel=0,
+                                                      led_array=0, reference_property='sum_col_val'):
+        """Fail unless the analysis with average_images set computed coefficients of the averaged images.
+
+        The reference images at the beginning are kept as they are, the images after them are
+        summarized two by two. The averaged intensities go into a binary of their own, the averaged
+        images are numbered from 1 again, and every coefficient is put on the mean experiment time
+        of the images it was averaged from.
+
+        :param num_ref_images: Number of reference images config_analysis.ini was written with.
+        """
+        num_ref_images = int(num_ref_images)
+        times = list(read_experiment_times_of_images(
+            os.path.join('analysis', 'image_infos_analysis.csv')).values())
+        tail = times[num_ref_images:]
+        expected_times = [round(t, 6) for t in times[:num_ref_images]]
+        expected_times += [round(float(np.mean(tail[n:n + NUM_IMGS_PER_AVERAGE])), 6)
+                           for n in range(0, len(tail), NUM_IMGS_PER_AVERAGE)]
+
+        binary_path = os.path.join('analysis', f'channel{channel}', 'all_parameters_avg.h5')
+        if not os.path.exists(binary_path):
+            raise AssertionError(f'{binary_path} of the averaged intensities was not written')
+        binary_img_ids = [int(img_id) for img_id in
+                          sorted(pd.read_hdf(binary_path, key='channel_values')['img_id'].unique())]
+
+        infos_path = os.path.join('analysis', 'image_infos_analysis_avg.csv')
+        if not os.path.exists(infos_path):
+            raise AssertionError(f'{infos_path} of the averaged images was not written')
+        infos = pd.read_csv(infos_path)
+        infos_img_ids = [int(img_id) for img_id in infos['#ID']]
+        if infos_img_ids != binary_img_ids:
+            raise AssertionError(f'{infos_path} holds the image IDs {infos_img_ids}, while the averaged '
+                                 f'binary holds {binary_img_ids}')
+        infos_times = [round(float(t), 6) for t in infos['Experiment_Time[s]']]
+        if infos_times != expected_times:
+            raise AssertionError(f'Experiment times in {infos_path} are {infos_times}, '
+                                 f'expected {expected_times}')
+
+        file_path = extinction_coefficients_path(solver, channel, led_array, reference_property)
+        filename = os.path.basename(file_path)
+        data = np.atleast_2d(np.genfromtxt(file_path, delimiter=',', comments='#'))
+        result_times = [round(float(t), 6) for t in data[:, 0]]
+        if result_times != expected_times:
+            raise AssertionError(f'Experiment times in {filename} are {result_times}, '
+                                 f'expected {expected_times}')
+        if np.isnan(data[:, 1:]).any():
+            raise AssertionError(f'{filename} contains NaN extinction coefficients')
+
+    @keyword
+    def extco_time_axis_should_be_accepted(self):
+        """Fail if reading the extinction coefficients warns about the experiment times of their files."""
+        messages = _read_extco_with_warnings()
+        if messages:
+            raise AssertionError(f'Reading the extinction coefficients warned: {messages}')
+
+    @keyword
+    def extco_time_axis_mismatch_should_be_reported(self, shift=0.5):
+        """Fail unless reading the extinction coefficients warns once the image times have moved.
+
+        Shifts every experiment time in the image infos, which is what re-running step 1 or step 3 with
+        other image metadata does to them, and puts the file back afterwards.
+
+        :param shift: Seconds added to every experiment time.
+        """
+        infos_path = os.path.join('analysis', 'image_infos_analysis.csv')
+        with open(infos_path, encoding='utf-8') as infos_file:
+            original = infos_file.read()
+        shifted_lines = []
+        for line in original.splitlines():
+            if line.startswith('#') or not line.strip():
+                shifted_lines.append(line)
+                continue
+            img_id, name, clock, experiment_time = line.split(',')
+            shifted_lines.append(f'{img_id},{name},{clock},{float(experiment_time) + float(shift)}')
+        try:
+            with open(infos_path, 'w', encoding='utf-8') as infos_file:
+                infos_file.write('\n'.join(shifted_lines) + '\n')
+            messages = _read_extco_with_warnings()
+        finally:
+            with open(infos_path, 'w', encoding='utf-8') as infos_file:
+                infos_file.write(original)
+        if not any('Run the analysis again' in message for message in messages):
+            raise AssertionError('Reading the extinction coefficients did not report that they were '
+                                 f'computed for other experiment times. Warnings: {messages}')
+
+    @keyword
+    def get_analysis_image_id(self, img_name):
+        """Get the analysis ID that 'image_infos_analysis.csv' assigns to an image."""
+        file_path = os.path.join('analysis', 'image_infos_analysis.csv')
+        with open(file_path, encoding='utf-8') as infos_file:
+            for line in infos_file:
+                if line.startswith('#') or not line.strip():
+                    continue
+                img_id, name = line.split(',')[:2]
+                if name == img_name:
+                    return img_id
+        raise AssertionError(f'{img_name} is not listed in {file_path}')
+
+    @keyword
+    def rename_test_images_to_padded_ids(self, num_digits=4):
+        """Rename test_data/test_img_<id>.jpg to zero padded IDs (test_img_0001.jpg), as most cameras write them."""
+        for path in glob.glob(os.path.join('test_data', 'test_img_*.jpg')):
+            img_id = int(os.path.basename(path)[len('test_img_'):-len('.jpg')])
+            os.rename(path, os.path.join('test_data', f'test_img_{img_id:0{int(num_digits)}d}.jpg'))
+
+    @keyword
+    def get_led_search_area_extent(self):
+        """Return how far the LED positions found by step 1 reach, as (rows, columns) in pixels.
+
+        The test images show one LED array along the height of the image, so the extent tells
+        whether step 1 read the image in the orientation it was taken in.
+        """
+        search_areas = np.atleast_2d(np.loadtxt(os.path.join('analysis', 'led_search_areas.csv'), delimiter=','))
+        return [int(np.ptp(search_areas[:, 1])), int(np.ptp(search_areas[:, 2]))]
+
+    @keyword
+    def turn_test_images_sideways(self, write_orientation=True):
+        """Store the test images the way a camera held on its side writes a vertical photo.
+
+        The pixels are turned counter-clockwise, so that they have to be turned back clockwise
+        to be upright, and the EXIF orientation of the image says so. Images exported without
+        their metadata carry no orientation, which write_orientation=False reproduces: only the
+        img_rotation option of the config can turn those back.
+        """
+        for path in sorted(glob.glob(os.path.join('test_data', 'test_img_*.jpg'))):
+            turn_img_sideways(path, write_orientation=write_orientation)
+
+    @keyword
+    def set_config_option(self, section, option, value):
+        """Set an option in the config.ini of the current directory."""
+        conf = ConfigData()
+        conf[section][option] = str(value)
+        conf.save()
+
+    @keyword
+    def count_config_help_texts(self):
+        """Return the number of comment lines of the config.ini of the current directory.
+
+        The comments are the only documentation the options of a config carry, so a run of
+        LEDSA, which writes the config back whenever it fills in a value it asked for or read
+        from an image, has to leave them where they are.
+        """
+        with open('config.ini', encoding='utf-8-sig') as config_file:
+            return len([line for line in config_file if line.strip().startswith(('#', ';'))])
+
+    @keyword
+    def analysed_image_names_should_be(self, *expected_img_names):
+        """Fail unless exactly the given images are listed in 'image_infos_analysis.csv'."""
+        file_path = os.path.join('analysis', 'image_infos_analysis.csv')
+        img_names = []
+        with open(file_path, encoding='utf-8') as infos_file:
+            for line in infos_file:
+                if not line.startswith('#') and line.strip():
+                    img_names.append(line.split(',')[1])
+        if img_names != list(expected_img_names):
+            raise AssertionError(f'Analysed images are {img_names}, expected {list(expected_img_names)}')
+
+def read_experiment_times_of_images(infos_path):
+    """Read the experiment times of an 'image_infos_analysis.csv' file as {image name: time}."""
+    times_of_img = {}
+    with open(infos_path, encoding='utf-8') as infos_file:
+        for line in infos_file:
+            if line.startswith('#') or not line.strip():
+                continue
+            _, name, _, experiment_time = line.strip().split(',')
+            times_of_img[name] = float(experiment_time)
+    return times_of_img
+
+def extinction_coefficients_path(solver, channel, led_array, reference_property='sum_col_val'):
+    """Path of an extinction coefficient file, which lies in a directory of its solver and quantity.
+
+    The layout is spelled out here instead of taken from ledsa, so that the tests check the
+    directories the analysis writes its results into.
+    """
+    filename = (f'extinction_coefficients_{solver}_channel_{channel}_{reference_property}'
+                f'_led_array_{led_array}.csv')
+    return os.path.join('analysis', 'extinction_coefficients', solver, reference_property, filename)
+
+def load_stacked_extinction_coefficients_computed(solver, channel, led_array_id,
+                                                  reference_property='sum_col_val'):
+    data = np.atleast_2d(np.loadtxt(
+        extinction_coefficients_path(solver, channel, led_array_id, reference_property), delimiter=','))
+    return data[:, 0], data[:, 1:]
+
+def load_extinction_coefficients_computed(solver, channel, led_array, reference_property='sum_col_val'):
     data = np.loadtxt(
-        os.path.join('analysis', 'extinction_coefficients', solver, filename),delimiter=',')
+        extinction_coefficients_path(solver, channel, led_array, reference_property), delimiter=',')
     time = data[:, 0]
     extinction_coefficients_computed = data[:, 1:]
     return time, extinction_coefficients_computed
 
-def create_test_image(image_id, experiment, img_dir='test_data'):
+def create_test_image(image_id, experiment, img_dir='test_data', background=0):
     """ Creates three test images with black and gray pixels representing 3 leds and sets the exif data needed
     The first image has 100% transmission on all LEDs, the second image has 50% transmission on all LEDs,
     the third has 50%, 70% and 80% transmission on the top, middle and bottom LEDs.
@@ -353,7 +793,7 @@ def create_test_image(image_id, experiment, img_dir='test_data'):
     transmissions = experiment.calc_all_led_transmissions()
 
     # Reverse transmissions because images are created from top down
-    img_array = create_img_array(num_of_leds, list(reversed(transmissions)))
+    img_array = create_img_array(num_of_leds, list(reversed(transmissions)), background=background)
     img = Image.fromarray(img_array, 'RGB')
 
     # Save image without EXIF data
@@ -365,14 +805,38 @@ def create_test_image(image_id, experiment, img_dir='test_data'):
     img2.readMetadata()
     ex = img2.exifData()
     ex["Exif.Photo.DateTimeOriginal"] = f"2021:01:01 12:00:{image_id:02d}"
+    # Cameras store the fraction of the second in a tag of its own. A different fraction per image makes
+    # sure that it reaches the image times instead of being rounded away.
+    ex["Exif.Photo.SubSecTimeOriginal"] = f"{image_id * 25 % 100:02d}"
     img2.setExifData(ex)
     img2.writeMetadata()
 
 
-def create_img_array(num_of_leds, transmissions):
+def turn_img_sideways(path, write_orientation=True):
+    """Turn the pixels of an image counter-clockwise, keeping the EXIF entries of the camera.
+
+    Saving the turned pixels writes a file without any metadata, so the entries of the original
+    are read before and written back afterwards, together with the orientation of a camera that
+    was held on its side.
+    """
+    img = exiv2.ImageFactory.open(path)
+    img.readMetadata()
+    exif_data = img.exifData()  # img keeps exif_data alive
+    Image.fromarray(np.rot90(np.asarray(Image.open(path)))).save(path)
+    if write_orientation:
+        exif_data['Exif.Image.Orientation'] = '6'  # to be turned clockwise to be upright
+    turned_img = exiv2.ImageFactory.open(path)
+    turned_img.readMetadata()
+    turned_img.setExifData(exif_data)
+    turned_img.writeMetadata()
+
+
+def create_img_array(num_of_leds, transmissions, background=0):
     img = np.zeros((num_of_leds * 50 + 50, 50, 3), np.uint8)
     for led_id in range(num_of_leds):
         add_led(img, (1 + led_id) * 50, 25, transmissions[led_id])
+    if background:
+        img = np.clip(img.astype(np.int16) + int(background), 0, 255).astype(np.uint8)
     return img
 
 
@@ -392,6 +856,32 @@ def calc_color_val(x, y, size, rv):
     dist = ((size / 2 - x) ** 2 + (size / 2 - y) ** 2) ** 0.5
     scale = 1.7
     return rv.pdf(dist / scale) * 350 * scale
+
+
+def _read_extco_with_warnings():
+    """Read the extinction coefficient files through the postprocessing and return its warnings."""
+    experiment_dir = os.getcwd()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            sim_data = SimData(experiment_dir, read_all=False, load_config_params=True)
+            sim_data._get_extco_df_from_path()
+    finally:
+        # SimData changes into the experiment directory and does not change back
+        os.chdir(experiment_dir)
+    return [str(entry.message) for entry in caught if entry.category is UserWarning]
+
+
+def run_ledsa_capturing_stderr(arg):
+    """Run ledsa and return its exit code and stderr, without the stderr check of execute_ledsa.
+
+    :param arg: Command line argument ledsa is called with.
+    :return: Exit code and decoded stderr of the run.
+    :rtype: Tuple[int, str]
+    """
+    p = Popen(['python', '-m', 'ledsa', arg], stdin=PIPE, stdout=PIPE, stderr=PIPE)
+    _, stderr = p.communicate()
+    return p.returncode, stderr.decode('utf-8')
 
 
 def wait_for_process_to_finish(p, inp=None):

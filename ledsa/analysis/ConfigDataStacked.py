@@ -2,6 +2,10 @@ import configparser as cp
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ledsa.analysis.ConfigDataAnalysis import DEFAULT_REFERENCE_PROPERTY, parse_reference_properties
+from ledsa.analysis.temperature_correction import TEMPERATURE_CORRECTION_CHANNELS
+from ledsa.core.config_file import save_config
+
 
 class ConfigDataStacked(cp.ConfigParser):
     """
@@ -22,10 +26,11 @@ class ConfigDataStacked(cp.ConfigParser):
         camera_channels   = 0 1 2
         num_layers        = 20
         domain_bounds     = 0.0 3.0
-        reference_property = sum_col_val
+        reference_property = sum_col_val bgsub_sum_col_val
         num_ref_images    = 10
         ref_img_indices   = None
         average_images    = False
+        n_summarize       = 2
         num_cores         = 1
         output_path       = .
         time_sync_tolerance = 0.5
@@ -37,6 +42,8 @@ class ConfigDataStacked(cp.ConfigParser):
         [simulation_1]
         path             = /data/exp01/cam1
         camera_position  = -1.0 0.0 1.5
+        # num_ref_images and ref_img_indices may be set per camera and override [DEFAULT]
+        ref_img_indices  = 385 386 387
 
         [led_arrays]
         # integer_id = sim_index:led_array_id  [sim_index:led_array_id ...]
@@ -72,7 +79,8 @@ class ConfigDataStacked(cp.ConfigParser):
         :raises SystemExit: if the file is not found.
         """
         try:
-            self.read_file(open(self._filename))
+            with open(self._filename, encoding='utf-8-sig') as config_file:
+                self.read_file(config_file)
         except FileNotFoundError:
             print(
                 f'{self._filename} not found in the working directory! '
@@ -82,9 +90,8 @@ class ConfigDataStacked(cp.ConfigParser):
         print(f'{self._filename} loaded.')
 
     def save(self) -> None:
-        """Write the current configuration back to disk."""
-        with open(self._filename, 'w') as f:
-            self.write(f)
+        """Write the current configuration back to disk, keeping the comments of the file."""
+        save_config(self, self._filename)
         print(f'{self._filename} saved.')
 
     # ------------------------------------------------------------------
@@ -137,6 +144,23 @@ class ConfigDataStacked(cp.ConfigParser):
         """Camera position ``[x, y, z]`` for simulation *sim_idx*."""
         return self.get_list_of_values(f'simulation_{sim_idx}', 'camera_position', dtype=float)
 
+    def get_ref_img_indices(self, sim_idx: int) -> Optional[List[int]]:
+        """Reference image IDs of simulation *sim_idx*; ``None`` means use
+        :meth:`get_num_ref_images`.
+
+        Image IDs are counted per camera and the cameras run at their own cadence, so the
+        images taken before the fire differ from camera to camera. A value in
+        ``[simulation_N]`` therefore overrides the one in ``[DEFAULT]`` for that camera,
+        a missing value is inherited from ``[DEFAULT]``, and ``None`` in a section switches
+        that camera back to :meth:`get_num_ref_images` even if ``[DEFAULT]`` holds a list.
+        """
+        return self.get_list_of_values(f'simulation_{sim_idx}', 'ref_img_indices',
+                                       dtype=int, fallback=None)
+
+    def get_num_ref_images(self, sim_idx: int) -> int:
+        """Number of reference images of simulation *sim_idx*, inherited from ``[DEFAULT]``."""
+        return int(self.get(f'simulation_{sim_idx}', 'num_ref_images', fallback='10'))
+
     # ------------------------------------------------------------------
     # LED-array mapping
     # ------------------------------------------------------------------
@@ -188,32 +212,53 @@ class ConfigDataStacked(cp.ConfigParser):
     @property
     def weighting_curvature(self) -> float:
         """Curvature weighting for the nonlinear solver."""
-        return float(self.get('DEFAULT', 'weighting_curvature', fallback='1e-6'))
+        return float(self.get('DEFAULT', 'weighting_curvature', fallback='1e-2'))
 
     @property
     def num_iterations(self) -> int:
         """Maximum iterations for the nonlinear solver."""
-        return int(self.get('DEFAULT', 'num_iterations', fallback='200'))
+        return int(self.get('DEFAULT', 'num_iterations', fallback='1000'))
+
+    @property
+    def reference_properties(self) -> List[str]:
+        """Column names used as the LED intensity measure, one stacked analysis each."""
+        return parse_reference_properties(
+            self.get('DEFAULT', 'reference_property', fallback=DEFAULT_REFERENCE_PROPERTY))
 
     @property
     def reference_property(self) -> str:
-        """Column name used as the LED intensity measure."""
-        return self.get('DEFAULT', 'reference_property', fallback='sum_col_val')
+        """First of :attr:`reference_properties`, the quantity of a single analysis."""
+        return self.reference_properties[0]
 
     @property
     def num_ref_images(self) -> int:
-        """Number of reference images used to compute I₀."""
+        """Number of reference images used to compute I₀, as set in ``[DEFAULT]``.
+
+        Use :meth:`get_num_ref_images` to get the value of a single camera.
+        """
         return int(self.get('DEFAULT', 'num_ref_images', fallback='10'))
 
     @property
     def ref_img_indices(self) -> Optional[List[int]]:
-        """Explicit reference image indices; ``None`` → use *num_ref_images*."""
+        """Explicit reference image indices of ``[DEFAULT]``; ``None`` → use *num_ref_images*.
+
+        Use :meth:`get_ref_img_indices` to get the indices of a single camera.
+        """
         return self.get_list_of_values('DEFAULT', 'ref_img_indices', dtype=int, fallback=None)
 
     @property
     def average_images(self) -> bool:
-        """Whether to use averaged image pairs."""
+        """Whether to average the intensities over :attr:`n_summarize` consecutive images."""
         return self.getboolean('DEFAULT', 'average_images', fallback=False)
+
+    @property
+    def n_summarize(self) -> int:
+        """Number of consecutive images summarized into one when :attr:`average_images` is set.
+
+        The reference images are kept as they are, so the first :attr:`num_ref_images` images of
+        every camera are not summarized.
+        """
+        return int(self.get('DEFAULT', 'n_summarize', fallback='2'))
 
     @property
     def num_cores(self) -> int:
@@ -245,6 +290,27 @@ class ConfigDataStacked(cp.ConfigParser):
         """Maximum allowed difference [s] when matching images across simulations."""
         return float(self.get('DEFAULT', 'time_sync_tolerance', fallback='0.5'))
 
+    def get_reduction_file(self, channel: int) -> Optional[str]:
+        """Path of the reduction factor file of the temperature correction of *channel*.
+
+        The factors apply to the LEDs themselves, so all cameras of a stacked inversion share
+        the file of a channel. A config file written before the temperature correction existed
+        has no ``[temperature_correction]`` section, which asks for no correction just like the
+        option left at ``None``.
+
+        :param channel: The camera channel.
+        :return: The configured path, ``None`` if the channel is analysed without the correction.
+        """
+        option = f'reduction_file_channel_{channel}'
+        if not self.has_section('temperature_correction'):
+            return None
+        if not self.has_option('temperature_correction', option):
+            return None
+        raw = self.get('temperature_correction', option, fallback='None').strip()
+        if raw.lower() == 'none' or raw == '':
+            return None
+        return raw
+
     # ------------------------------------------------------------------
     # Factory: write a template config to disk
     # ------------------------------------------------------------------
@@ -266,14 +332,17 @@ class ConfigDataStacked(cp.ConfigParser):
         cfg['DEFAULT']['lambda_reg'] = '1e-3'
         cfg.set('DEFAULT', '# Nonlinear solver weights (ignored when solver = linear)')
         cfg['DEFAULT']['weighting_preference'] = '-6e-3'
-        cfg['DEFAULT']['weighting_curvature'] = '1e-6'
-        cfg['DEFAULT']['num_iterations'] = '200'
+        cfg['DEFAULT']['weighting_curvature'] = '1e-2'
+        cfg['DEFAULT']['num_iterations'] = '1000'
         cfg.set('DEFAULT', '# ── Image / reference ──────────────────────────────────────────────')
+        cfg.set('DEFAULT', '# Quantities the extinction coefficients are computed from, separated by spaces')
         cfg['DEFAULT']['reference_property'] = 'sum_col_val'
         cfg['DEFAULT']['num_ref_images'] = '10'
         cfg.set('DEFAULT', "# Explicit reference image indices (overrides num_ref_images); 'None' to disable")
         cfg['DEFAULT']['ref_img_indices'] = 'None'
         cfg['DEFAULT']['average_images'] = 'False'
+        cfg.set('DEFAULT', '# Consecutive images summarized into one when average_images is True')
+        cfg['DEFAULT']['n_summarize'] = '2'
         cfg.set('DEFAULT', '# ── Channels / parallelism ─────────────────────────────────────────')
         cfg.set('DEFAULT', '# Space-separated list: 0 = R, 1 = G, 2 = B')
         cfg['DEFAULT']['camera_channels'] = '0'
@@ -295,6 +364,22 @@ class ConfigDataStacked(cp.ConfigParser):
             cfg[section]['path'] = f'/path/to/sim{i}'
             cfg.set(section, '# Global X Y Z position [m] of camera')
             cfg[section]['camera_position'] = '0.0 0.0 1.5'
+            cfg.set(section, '# Reference images of this camera; both options override the ones above')
+            cfg.set(section, '# Image IDs are counted per camera, so choose images from the same time')
+            cfg.set(section, '# window before the fire in every camera')
+            cfg.set(section, '# ref_img_indices = 385 386 387   (None falls back to num_ref_images)')
+            cfg.set(section, '# num_ref_images = 10')
+
+        cfg['temperature_correction'] = {}
+        cfg.set('temperature_correction', '# Correction of the LED intensities for the temperature of the LEDs.')
+        cfg.set('temperature_correction', '# Path of the reduction factor file of every camera channel. A channel with a file')
+        cfg.set('temperature_correction', '# is corrected with it, a channel set to None is analysed as extracted. The factors')
+        cfg.set('temperature_correction', '# are computed outside LEDSA and read from a CSV file holding the experiment time [s]')
+        cfg.set('temperature_correction', '# in its first column, the LED height [m] in its header and the factor the intensity')
+        cfg.set('temperature_correction', '# of that time and height is reduced by in its cells. They apply to the LEDs, so all')
+        cfg.set('temperature_correction', '# cameras of the stacked inversion share the file of a channel.')
+        for channel in TEMPERATURE_CORRECTION_CHANNELS:
+            cfg['temperature_correction'][f'reduction_file_channel_{channel}'] = 'None'
 
         cfg['led_arrays'] = {}
         cfg.set('led_arrays', '# Each line maps a virtual array ID (integer) to one or more  sim_index:led_array_id  tokens.')

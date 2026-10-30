@@ -34,7 +34,7 @@ Data Extraction
      - Step 3: Analyse all images to extract pixel values inside the search areas and fit them to an LED model (SLOW!).
      - ``--r`` (Use the red channel, default), ``--g`` (Use the green channel), ``--b`` (Use the blue channel), ``-rgb`` (Run for each channel)
    * - ``-s3_fast``, ``--step_3_fast`, ``--analyse_photo_fast``
-     - Step 3: Analyse all images to extract pixel values and calculate the accumulated values inside the search areas (FAST!).
+     - Step 3: Analyse all images to extract pixel values and calculate the accumulated values inside the search areas (FAST!). Besides the plain sum, the background-corrected sums ``bgsub_sum_col_val``, ``bgsub2_sum_col_val`` and ``sidebg_sum_col_val`` are written (see ``reference_property`` in the analysis configuration).
      - --
    * - ``-re``, ``--restart``
      - Restart step 3 if it was previously interrupted. Only the images that have not been analysed are taken into account.
@@ -55,7 +55,7 @@ Analysis
      - Creates the analysis configuration file.
      - --
    * - ``-a``, ``--analysis``
-     - Computes the extinction coefficients.
+     - Computes the extinction coefficients of every quantity ``reference_property`` names in ``config_analysis.ini``, each into ``analysis/extinction_coefficients/<solver>/<quantity>/``.
      - --
    * - ``--cc``
      - Applies the color correction matrix before calculating the extinction coefficients. Use only if the reference property is not already color corrected.
@@ -84,7 +84,7 @@ Stacked Multi-Camera Analysis
      - Number of ``[simulation_N]`` blocks written into the template ``config_stacked.ini``. Only used together with ``-conf_s``.
      - Default: 2
    * - ``-as``, ``--analysis_stacked``
-     - Run the stacked multi-camera extinction coefficient calculation using ``config_stacked.ini`` in the current directory.
+     - Run the stacked multi-camera extinction coefficient calculation using ``config_stacked.ini`` in the current directory, for every quantity its ``reference_property`` names.
      - --
 
 Coordinates

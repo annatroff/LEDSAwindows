@@ -1,12 +1,13 @@
 import glob
 import os
+import warnings
 
 import numpy as np
 import pandas as pd
 
 from ledsa.core.image_reading import read_channel_data_from_img
 from ledsa.core.ConfigData import ConfigData
-from ledsa.analysis.ConfigDataAnalysis import ConfigDataAnalysis
+from ledsa.analysis.ConfigDataAnalysis import ConfigDataAnalysis, DEFAULT_REFERENCE_PROPERTY
 from ledsa.analysis.ConfigDataStacked import ConfigDataStacked
 
 
@@ -26,6 +27,7 @@ class _BaseSimData:
     def __init__(self):
         self.all_extco_df = None
         self.solver = None
+        self.reference_property = DEFAULT_REFERENCE_PROPERTY
         self.camera_channels = [0]
         self.num_ref_images = None
         self.n_layers = None
@@ -61,6 +63,29 @@ class _BaseSimData:
             / (self.upper_domain_bound - self.lower_domain_bound)
             * self.n_layers
         )
+
+    # ------------------------------------------------------------------
+    # Result files
+    # ------------------------------------------------------------------
+
+    def _extco_files(self, root):
+        """
+        Return the extinction coefficient files of the solver and the quantity of this object.
+
+        :param root: Directory the analysis directory lies in.
+        :type root: str
+        :return: Paths of the result files, empty if neither layout holds any.
+        :rtype: list[str]
+        """
+        solver_dir = os.path.join(root, 'analysis', 'extinction_coefficients', self.solver)
+        files = glob.glob(os.path.join(solver_dir, self.reference_property,
+                                       'extinction_coefficients*.csv'))
+        if not files:
+            # Results of a LEDSA version before every quantity got a directory of its own lie
+            # directly in the directory of the solver, where the quantity is part of the file
+            # name only. Such a directory holds the results of a single quantity per run.
+            files = glob.glob(os.path.join(solver_dir, 'extinction_coefficients*.csv'))
+        return files
 
     # ------------------------------------------------------------------
     # Smoothing
@@ -246,7 +271,8 @@ class _BaseSimData:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class SimData(_BaseSimData):
-    def __init__(self, path_simulation, read_all=True, remove_duplicates=False, load_config_params=True):
+    def __init__(self, path_simulation, read_all=True, remove_duplicates=False, load_config_params=True,
+                 reference_property=None):
         """
         Initializes SimData with simulation and image analysis settings.
 
@@ -258,8 +284,14 @@ class SimData(_BaseSimData):
         :type remove_duplicates: bool, optional
         :param load_config_params: If True, loads parameters from config files, defaults to True.
         :type load_config_params: bool, optional
+        :param reference_property: Quantity whose extinction coefficients are read. Defaults to the
+            first quantity of the analysis configuration, since one analysis run can compute
+            several of them.
+        :type reference_property: str, optional
         """
         super().__init__()
+        if reference_property is not None:
+            self.reference_property = reference_property
         self.led_params_timedelta = 0
         self.ch0_ledparams_df = None
         self.ch1_ledparams_df = None
@@ -280,6 +312,8 @@ class SimData(_BaseSimData):
             self.path_images = self.config['find_search_areas']['img_directory']
 
             self.solver = self.config_analysis['DEFAULT']['solver']
+            if reference_property is None:
+                self.reference_property = self.config_analysis.get_reference_properties()[0]
             self.average_images = self.config_analysis.getboolean('DEFAULT', 'average_images')
             self.camera_channels = self.config_analysis.get_list_of_values('DEFAULT', 'camera_channels', dtype=int)
             self.num_ref_images = int(self.config_analysis['DEFAULT']['num_ref_images'])
@@ -332,8 +366,10 @@ class SimData(_BaseSimData):
         else:
             file = os.path.join(self.path_simulation, 'analysis', f'channel{channel}', 'all_parameters.h5')
         table = pd.read_hdf(file, key='channel_values')
+        # Not rounded to whole seconds: images taken less than a second apart would otherwise share
+        # a time and be merged into one entry.
         time = pd.Series(
-            self.image_info_df['Experiment_Time[s]'].astype(int).values,
+            self.image_info_df['Experiment_Time[s]'].values,
             index=self.image_info_df['#ID'],
             name='Experiment_Time[s]',
         )
@@ -344,24 +380,27 @@ class SimData(_BaseSimData):
 
     def _get_extco_df_from_path(self):
         """
-        Read all extinction coefficients from the simulation dir and put them in all_extco_df.
+        Read the extinction coefficients of one quantity from the simulation dir into all_extco_df.
         """
         extco_list = []
-        files_list = glob.glob(
-            os.path.join(
-                self.path_simulation, 'analysis', 'extinction_coefficients',
-                self.solver, 'extinction_coefficients*.csv',
-            )
-        )
+        files_list = self._extco_files(self.path_simulation)
+        if not files_list:
+            searched = os.path.join(self.path_simulation, 'analysis', 'extinction_coefficients',
+                                    str(self.solver), str(self.reference_property))
+            raise FileNotFoundError(
+                f'No extinction coefficient files of {self.reference_property} in {searched}. Run '
+                f'the analysis (--analysis) for this quantity, or name another one with the '
+                f'reference_property argument of SimData.')
         for file in files_list:
             file_df = pd.read_csv(file, skiprows=7)
             channel = int(file.split('channel_')[1].split('_')[0])
             led_array = int(file.split('array_')[1].split('.')[0])
             if '# Experiment_Time[s]' not in file_df.columns:
-                time = self.image_info_df['Experiment_Time[s]'].astype(int)
+                time = self.image_info_df['Experiment_Time[s]']
                 file_df = file_df.merge(time, left_index=True, right_index=True)
             else:
                 file_df.rename(columns={'# Experiment_Time[s]': 'Experiment_Time[s]'}, inplace=True)
+                self._warn_on_foreign_experiment_times(file_df['Experiment_Time[s]'], file)
             file_df.set_index('Experiment_Time[s]', inplace=True)
             n_layers = len(file_df.columns)
             file_df.columns = pd.MultiIndex.from_product(
@@ -372,6 +411,35 @@ class SimData(_BaseSimData):
         self.all_extco_df = pd.concat(extco_list, axis=1)
         self.all_extco_df.sort_index(ascending=True, axis=1, inplace=True)
         self.all_extco_df = self.all_extco_df[~self.all_extco_df.index.duplicated(keep='first')]
+
+    def _warn_on_foreign_experiment_times(self, experiment_times, file, tolerance=1e-6):
+        """
+        Warn if an extinction coefficient file was computed from other image times than the current ones.
+
+        The files carry their own time axis, while the LED parameters are put on the times read from the
+        image infos. Re-running step 1 or step 3 therefore moves the LED parameters but leaves the
+        coefficients on the times of the earlier run, which nothing else would notice: both data frames
+        are simply indexed by times that no longer belong to the same images. Images the analysis left
+        out are no mismatch, so only times without a counterpart in the image infos are reported.
+
+        :param experiment_times: Experiment times the file was computed for.
+        :type experiment_times: pandas.Series
+        :param file: Path of the extinction coefficient file, used for the message.
+        :type file: str
+        :param tolerance: Largest difference in seconds still counted as the same time.
+        :type tolerance: float
+        """
+        image_times = self.image_info_df['Experiment_Time[s]'].to_numpy(dtype=float)
+        file_times = experiment_times.to_numpy(dtype=float)
+        foreign = file_times[[not np.any(np.abs(image_times - time) <= tolerance) for time in file_times]]
+        if foreign.size == 0:
+            return
+        warnings.warn(
+            f'{os.path.basename(file)} was computed for {foreign.size} of {file_times.size} experiment '
+            f'times that the image infos do not contain, the first one being {foreign[0]} s. The file is '
+            f'left over from an earlier run and does not line up with the LED parameters. Run the '
+            f'analysis again to recompute it.',
+            UserWarning, stacklevel=3)
 
     def read_led_params(self):
         """Read led parameters for all color channels from the simulation path."""
@@ -469,7 +537,7 @@ class SimData(_BaseSimData):
         Retrieves the image name corresponding to a specific time.
 
         :param time: The time index.
-        :type time: int
+        :type time: float
         :return: The name of the image.
         :rtype: str
         """
@@ -513,7 +581,8 @@ class SimData(_BaseSimData):
             pixel_positions = self.get_pixel_cordinates_of_LED(led_id)
             imagename = self.get_image_name_from_time(time)
             imagefile = os.path.join(self.path_images, imagename)
-            channel_array = read_channel_data_from_img(imagefile, channel)
+            channel_array = read_channel_data_from_img(imagefile, channel,
+                                                       rotation=self.config.get('DEFAULT', 'img_rotation'))
             x, y = pixel_positions[0], pixel_positions[1]
             return np.flip(channel_array[x - radius:x + radius, y - radius:y + radius], axis=0)
         return None
@@ -540,7 +609,7 @@ class StackedSimData(_BaseSimData):
     :vartype config_stacked: ConfigDataStacked
     """
 
-    def __init__(self, config_path='.', read_all=True):
+    def __init__(self, config_path='.', read_all=True, reference_property=None):
         """
         :param config_path: Directory containing ``config_stacked.ini``.
             Defaults to the current working directory.
@@ -548,6 +617,9 @@ class StackedSimData(_BaseSimData):
         :param read_all: If ``True``, immediately load all stacked extinction
             coefficient CSV files.  Defaults to ``True``.
         :type read_all: bool
+        :param reference_property: Quantity whose extinction coefficients are read. Defaults to
+            the first quantity of the stacked configuration.
+        :type reference_property: str, optional
         """
         super().__init__()
 
@@ -562,6 +634,8 @@ class StackedSimData(_BaseSimData):
         self.output_path = os.path.join(self.config_path, str(self.config_stacked.output_path))
 
         self.solver = self.config_stacked.solver
+        self.reference_property = (reference_property if reference_property is not None
+                                   else self.config_stacked.reference_properties[0])
         self.camera_channels = self.config_stacked.camera_channels
         self.num_ref_images = self.config_stacked.num_ref_images
         self._set_layer_geometry(self.config_stacked.domain_bounds, self.config_stacked.num_layers)
@@ -575,7 +649,7 @@ class StackedSimData(_BaseSimData):
 
         Files are expected in::
 
-            <output_path>/analysis/extinction_coefficients/<solver>/
+            <output_path>/analysis/extinction_coefficients/<solver>/<reference_property>/
 
         The virtual LED-array ID is stored as an integer in the
         ``all_extco_df`` MultiIndex (level ``"LED Array"``).
@@ -583,8 +657,9 @@ class StackedSimData(_BaseSimData):
         extco_list = []
         extco_dir = os.path.join(
             self.output_path, 'analysis', 'extinction_coefficients', self.solver,
+            self.reference_property,
         )
-        files = glob.glob(os.path.join(extco_dir, 'extinction_coefficients*.csv'))
+        files = self._extco_files(self.output_path)
 
         if not files:
             print(
